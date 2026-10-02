@@ -26,6 +26,13 @@ const {
 const { createNativeSpeechService } = require('./native-speech');
 const { createSpeechAuthorization } = require('./speech-authorization');
 const { createScreenAnnotate } = require('./screen-annotate');
+const {
+  PROTOCOL_SCHEME,
+  findProtocolUrl,
+  parseProtocolUrl,
+  buildCallUrl,
+} = require('./protocol-handoff');
+const { createCallWindowManager } = require('./call-window');
 
 // HL_APP_URL / HL_SIMULATE_OFFLINE / HL_DEBUG are dev-only overrides.
 const APP_URL = process.env.HL_APP_URL || 'https://hivelogic-live.vercel.app/';
@@ -40,6 +47,30 @@ function isCacheableHost(hostname) {
     hostname.endsWith('.supabase.co') ||
     hostname.endsWith('.supabase.in')
   );
+}
+
+// Sign-in popups (Microsoft 365 / MSAL) must open INSIDE the app so the auth
+// flow can complete and hand the token back. MSAL popups start as
+// about:blank, then navigate to the identity provider. Everything else
+// external opens in the default browser. Shared by every window this app
+// opens (mainWindow and the hivelogic:// call window below) so a popup/
+// pop-out from either one behaves the same way.
+const AUTH_POPUP_HOSTS = /(^|\.)login\.microsoftonline\.com$|(^|\.)login\.live\.com$|(^|\.)login\.microsoft\.com$|(^|\.)account\.microsoft\.com$/;
+function installWindowOpenHandler(win) {
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (url === 'about:blank' || url === '') {
+      return { action: 'allow', overrideBrowserWindowOptions: { autoHideMenuBar: true } };
+    }
+    try {
+      const u = new URL(url);
+      if (u.hostname === APP_HOST) return { action: 'allow' };
+      if (AUTH_POPUP_HOSTS.test(u.hostname)) {
+        return { action: 'allow', overrideBrowserWindowOptions: { autoHideMenuBar: true } };
+      }
+    } catch (_) {}
+    shell.openExternal(url);
+    return { action: 'deny' };
+  });
 }
 
 let mainWindow = null;
@@ -244,11 +275,20 @@ const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
 } else {
-  app.on('second-instance', () => {
+  // Windows launches a SECOND process when a hivelogic:// link is clicked
+  // while this app is already running; the single-instance lock above is
+  // what redirects that into this event on the ALREADY-running instance
+  // instead of two copies of the app existing at once. commandLine is that
+  // second process's own argv, which is where its protocol URL (if any)
+  // lives -- see findProtocolUrl()'s own comment on why every entry is
+  // checked rather than a fixed index.
+  app.on('second-instance', (_event, commandLine) => {
     if (mainWindow) {
       if (mainWindow.isMinimized()) mainWindow.restore();
       mainWindow.focus();
     }
+    const url = findProtocolUrl(commandLine);
+    if (url) handleProtocolUrl(url);
   });
 }
 
@@ -382,25 +422,7 @@ function createWindow() {
     }
   });
 
-  // Sign-in popups (Microsoft 365 / MSAL) must open INSIDE the app so the
-  // auth flow can complete and hand the token back. MSAL popups start as
-  // about:blank, then navigate to the identity provider. Everything else
-  // external opens in the default browser.
-  const AUTH_POPUP_HOSTS = /(^|\.)login\.microsoftonline\.com$|(^|\.)login\.live\.com$|(^|\.)login\.microsoft\.com$|(^|\.)account\.microsoft\.com$/;
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (url === 'about:blank' || url === '') {
-      return { action: 'allow', overrideBrowserWindowOptions: { autoHideMenuBar: true } };
-    }
-    try {
-      const u = new URL(url);
-      if (u.hostname === APP_HOST) return { action: 'allow' };
-      if (AUTH_POPUP_HOSTS.test(u.hostname)) {
-        return { action: 'allow', overrideBrowserWindowOptions: { autoHideMenuBar: true } };
-      }
-    } catch (_) {}
-    shell.openExternal(url);
-    return { action: 'deny' };
-  });
+  installWindowOpenHandler(mainWindow);
 
   mainWindow.on('close', () => saveWindowState(mainWindow));
   mainWindow.on('closed', () => {
@@ -418,6 +440,67 @@ function createWindow() {
     stopScreenAnnotate();
     mainWindow = null;
   });
+}
+
+/* ------------------------------------------------------------------ */
+/* hivelogic:// meeting-link handoff                                    */
+/*                                                                      */
+/* A guest/invite call link (call.html in the web app) tries this       */
+/* scheme before showing its join gate. Registering as its handler is   */
+/* what lets the OS hand the link to THIS app instead of a browser tab  */
+/* -- and because the call window below shares the app's one default   */
+/* session, whoever is already signed in here stays signed in on the    */
+/* call, instead of joining as a disconnected anonymous guest.          */
+/* ------------------------------------------------------------------ */
+const callWindowManager = createCallWindowManager({
+  BrowserWindow,
+  installWindowOpenHandler,
+  windowOptions: {
+    width: 1100,
+    height: 760,
+    minWidth: 480,
+    minHeight: 480,
+    backgroundColor: '#10131c',
+    title: 'HiveLogic',
+    icon: path.join(__dirname, '..', 'build', 'icon.png'),
+    autoHideMenuBar: true,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      spellcheck: true,
+    },
+  },
+});
+
+function registerProtocolClient() {
+  try {
+    // Unpackaged (dev) runs launch as `electron.exe <path-to-this-repo> ...`,
+    // not as a standalone .exe -- Windows needs to be told to hand the link
+    // back through exactly that launch command, or a registered dev build
+    // would open a dangling `electron.exe` with no app to load. Packaged
+    // builds need nothing extra; the installed .exe IS the handler.
+    if (process.platform === 'win32' && !app.isPackaged && process.argv.length >= 2) {
+      app.setAsDefaultProtocolClient(PROTOCOL_SCHEME, process.execPath, [path.resolve(process.argv[1])]);
+    } else {
+      app.setAsDefaultProtocolClient(PROTOCOL_SCHEME);
+    }
+  } catch (_) {
+    /* best-effort -- an unregistered scheme just means the web app's silent
+       fallback (hivelogic-launcher.js) keeps the guest in the browser */
+  }
+}
+
+// Origin-checked at the one point it matters: parseProtocolUrl() already
+// rejected anything that isn't `hivelogic://join` with a token-shaped m/p,
+// and buildCallUrl() only ever builds a URL on TRUSTED_APP_ORIGIN -- nothing
+// from the incoming link ever reaches the origin or path of what gets
+// loaded, only validated query values.
+function handleProtocolUrl(rawUrl) {
+  const params = parseProtocolUrl(rawUrl);
+  if (!params) return;
+  const target = buildCallUrl(TRUSTED_APP_ORIGIN, params);
+  callWindowManager.open(target);
 }
 
 /* ------------------------------------------------------------------ */
@@ -660,6 +743,13 @@ app.whenReady().then(() => {
 
   createWindow();
   setupAutoUpdate();
+  registerProtocolClient();
+
+  // Cold start directly from a hivelogic:// link (no other instance was
+  // running, so there was no 'second-instance' event for it) -- this
+  // process's OWN argv carries the link instead.
+  const launchUrl = findProtocolUrl(process.argv);
+  if (launchUrl) handleProtocolUrl(launchUrl);
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
